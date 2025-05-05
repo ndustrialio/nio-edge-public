@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump version
+        uses: TriPSs/conventional-changelog-action@v6
+        id: version
+        with:
+          github-token: ${{ secrets.NIO_BOT_TOKEN }}
+          preset: conventionalcommits
+          skip-version-file: true
+          skip-commit: true
+          output-file: false
+          skip-on-empty: false
+      - name: Create release
+        if: ${{ steps.version.outputs.skipped == 'false' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.version.outputs.clean_changelog }}
+          files: setup/*
+          token: ${{ secrets.NIO_BOT_TOKEN }}
