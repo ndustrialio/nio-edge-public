@@ -48,7 +48,10 @@ install_docker() {
   sudo apt-get install -y docker-ce
   sudo systemctl enable docker
   sudo systemctl start docker
-  sudo usermod -aG docker "$USER"
+  # Check if user 'nio' exists
+  if id nio &>/dev/null; then
+    sudo usermod -aG docker nio
+  fi
   echo "$QUAY_TOKEN" | docker login --username "ndustrialio+nio_edge_$TENANT" --password-stdin quay.io
 }
 
