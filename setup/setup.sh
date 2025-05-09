@@ -118,15 +118,15 @@ create_service() {
     return
   fi
 
-  echo "Creating environment file at /etc/run-edge.env"
-  sudo tee /etc/run-edge.env > /dev/null <<EOF
+  echo "Creating environment file at $NIO_DIR/run-edge.env"
+  sudo tee $NIO_DIR/run-edge.env > /dev/null <<EOF
 IDENTITY=$MACHINE_USER_ID
 EDGE_TOKEN=$EDGE_TOKEN
 DIRECTORY=/nio
 TENANT=$TENANT
 EOF
-  sudo chmod 640 /etc/run-edge.env
-  sudo chown root:root /etc/run-edge.env
+  sudo chmod 640 $NIO_DIR/run-edge.env
+  sudo chown root:root $NIO_DIR/run-edge.env
 
   echo "Creating systemd service for run-edge"
 
@@ -136,7 +136,7 @@ Description=Ndustrial Edge Service
 After=network.target
 
 [Service]
-EnvironmentFile=/etc/run-edge.env
+EnvironmentFile=$NIO_DIR/run-edge.env
 ExecStart=$NIO_DIR/run-edge
 Restart=always
 User=root
