@@ -15,6 +15,10 @@ esac
 echo "Detected OS: $OS_NAME"
 
 install_remoteit() {
+  echo "------------------------------
+Installing Remoteit
+------------------------------"
+  
   if [ ! -d "$NIO_DIR/remoteit" ]; then
     echo "Creating remoteit directory at $NIO_DIR/remoteit"
     mkdir -p "$NIO_DIR/remoteit"
@@ -30,25 +34,40 @@ install_remoteit() {
     exit 1
   fi
 
-  echo "Installing remoteit"
   R3_REGISTRATION_CODE="$R3_REGISTRATION_CODE" sh -c "$(curl -fsSL https://downloads.remote.it/remoteit/install_agent.sh)"
 }
 
 install_docker() {
+  echo "------------------------------
+Installing Docker
+------------------------------"
+
   if command -v docker >/dev/null 2>&1; then
     echo "Docker already installed"
     echo "$QUAY_TOKEN" | docker login --username "ndustrialio+nio_edge_$TENANT" --password-stdin quay.io
     return
   fi
 
-  echo "Installing Docker"
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-  sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" -y
+  # Remove conflicts
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
+
+  # Add Docker's official GPG key
   sudo apt-get update
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+  # Add the repository to Apt sources
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+    $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update
+
+  # Install Docker and start
   sudo apt-get install -y docker-ce
   sudo systemctl enable docker
   sudo systemctl start docker
-  # Check if user 'nio' exists
   if id nio &>/dev/null; then
     sudo usermod -aG docker nio
   fi
@@ -90,7 +109,9 @@ download_github_asset() {
 }
 
 initialize_nio() {
-  echo "Initializing NIO environment"
+  echo "------------------------------
+Initializing NIO environment
+------------------------------"
 
   sudo mkdir -p "$NIO_DIR"
   sudo chown "$USER":"$USER" "$NIO_DIR"
@@ -152,10 +173,10 @@ EOF
 }
 
 
-# Ensure required packages
-echo "Installing required packages (curl, jq, tar, unzip)"
+# Ensure required packages are installed
+echo "Installing required packages"
 sudo apt-get update
-sudo apt-get install -y curl jq tar unzip
+sudo apt-get install -y curl ca-certificates jq tar unzip
 
 # Optional installs
 install_docker
