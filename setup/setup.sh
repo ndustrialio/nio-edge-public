@@ -3,16 +3,39 @@ set -e
 
 NIO_DIR="/nio"
 
-# Detect OS once
-uname_out="$(uname -s)"
-case "${uname_out}" in
-  Linux*)  OS_NAME="linux"; ASSET_NAME="run-edge-linux.tar.gz" ;;
-  Darwin*) OS_NAME="macos"; ASSET_NAME="run-edge-macos.tar.gz" ;;
-  CYGWIN*|MINGW*|MSYS*) OS_NAME="win"; ASSET_NAME="run-edge-win.exe.zip" ;;
-  *) echo "Unsupported OS: $uname_out"; exit 1 ;;
+# Detect OS and Architecture
+UNAME_OS="$(uname -s)"
+UNAME_ARCH="$(uname -m)"
+OS_ARCH="${UNAME_OS}_${UNAME_ARCH}"
+
+case "$OS_ARCH" in
+  Linux_x86_64)
+    OS_NAME="linux"
+    ASSET_NAME="run-edge-linux-x64.tar.gz"
+    ;;
+  Linux_aarch64)
+    OS_NAME="linux"
+    ASSET_NAME="run-edge-linux-arm64.tar.gz"
+    ;;
+  Darwin_x86_64)
+    OS_NAME="macos"
+    ASSET_NAME="run-edge-macos-x64.tar.gz"
+    ;;
+  Darwin_aarch64)
+    OS_NAME="macos"
+    ASSET_NAME="run-edge-macos-arm64.tar.gz"
+    ;;
+  CYGWIN*_x86_64|MINGW*_x86_64|MSYS*_x86_64)
+    OS_NAME="windows"
+    ASSET_NAME="run-edge-windows-x64.exe.zip"
+    ;;
+  *)
+    echo "Unsupported OS/Architecture: $OS_ARCH"
+    exit 1
+    ;;
 esac
 
-echo "Detected OS: $OS_NAME"
+echo "Detected platform: $OS_ARCH"
 
 install_remoteit() {
   echo "------------------------------
@@ -114,7 +137,7 @@ Initializing NIO environment
 ------------------------------"
 
   sudo mkdir -p "$NIO_DIR"
-  sudo chown "$USER":"$USER" "$NIO_DIR"
+  sudo chown root:root "$NIO_DIR"
 
   download_github_asset
 
@@ -125,10 +148,9 @@ Initializing NIO environment
       rm -f "$NIO_DIR/run-edge.archive"
       chmod +x "$NIO_DIR/run-edge"
       ;;
-    win)
+    windows)
       unzip -o "$NIO_DIR/run-edge.archive" -d "$NIO_DIR"
       rm -f "$NIO_DIR/run-edge.archive"
-      mv "$NIO_DIR/run-edge-win.exe" "$NIO_DIR/run-edge.exe" || true
       ;;
   esac
 }
@@ -143,7 +165,7 @@ create_service() {
   sudo tee $NIO_DIR/run-edge.env > /dev/null <<EOF
 IDENTITY=$MACHINE_USER_ID
 EDGE_TOKEN=$EDGE_TOKEN
-DIRECTORY=/nio
+DIRECTORY=$NIO_DIR
 TENANT=$TENANT
 EOF
   sudo chmod 640 $NIO_DIR/run-edge.env
