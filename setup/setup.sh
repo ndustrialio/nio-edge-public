@@ -3,7 +3,7 @@ set -e
 
 NIO_DIR="/nio"
 
-# Detect OS and Architecture
+# Detect OS and architecture
 UNAME_OS="$(uname -s)"
 UNAME_ARCH="$(uname -m)"
 OS_ARCH="${UNAME_OS}_${UNAME_ARCH}"
