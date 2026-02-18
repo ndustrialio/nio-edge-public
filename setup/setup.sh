@@ -2,6 +2,37 @@
 set -e
 
 NIO_DIR="/nio"
+LOG_FILE="/tmp/setup-$(date +%Y%m%d-%H%M%S).log"
+
+# Capture all output to a log file
+exec > >(tee "$LOG_FILE") 2>&1
+
+# Ship logs to Datadog on exit (success or failure)
+ship_logs() {
+  local exit_code=$?
+  local status="info"
+  if [[ $exit_code -ne 0 ]]; then
+    status="error"
+  fi
+
+  if [[ -f "$LOG_FILE" && -n "$DD_API_KEY" ]]; then
+    local log_content
+    log_content=$(jq -Rs '.' < "$LOG_FILE")
+
+    echo "[{\"ddsource\":\"nio-edge\",\"ddtags\":\"owner:integrations,tenant:${TENANT:-unknown},machine_user_id:${MACHINE_USER_ID:-unknown}\",\"hostname\":\"$(hostname)\",\"service\":\"nio-edge-setup\",\"status\":\"${status}\",\"message\":${log_content}}]" \
+      | gzip \
+      | curl -s -X POST "https://http-intake.logs.datadoghq.com/api/v2/logs" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -H "Content-Encoding: gzip" \
+        -H "DD-API-KEY: $DD_API_KEY" \
+        --data-binary @- \
+      || echo "Warning: Failed to ship logs to Datadog"
+  fi
+
+  exit "$exit_code"
+}
+trap ship_logs EXIT
 
 # Detect OS and architecture
 UNAME_OS="$(uname -s)"
@@ -21,7 +52,7 @@ case "$OS_ARCH" in
     OS_NAME="macos"
     ASSET_NAME="run-edge-macos-x64.tar.gz"
     ;;
-  Darwin_aarch64)
+  Darwin_arm64)
     OS_NAME="macos"
     ASSET_NAME="run-edge-macos-arm64.tar.gz"
     ;;
@@ -37,6 +68,76 @@ esac
 
 echo "Detected platform: $OS_ARCH"
 
+if [[ "$OS_NAME" != "linux" ]]; then
+  echo "$OS_NAME is not yet supported"
+  exit 1
+fi
+
+# Validate required environment variables early
+missing_vars=()
+for var in DD_API_KEY GITHUB_TOKEN R3_REGISTRATION_CODE QUAY_TOKEN TENANT MACHINE_USER_ID EDGE_TOKEN; do
+  if [[ -z "${!var}" ]]; then
+    missing_vars+=("$var")
+  fi
+done
+if [[ ${#missing_vars[@]} -gt 0 ]]; then
+  echo "Error: Required environment variables not set: ${missing_vars[*]}"
+  exit 1
+fi
+
+install_datadog() {
+  echo "------------------------------
+Installing Datadog Agent
+------------------------------"
+
+  if command -v datadog-agent >/dev/null 2>&1; then
+    echo "Datadog agent already installed"
+    return
+  fi
+
+  DD_API_KEY="$DD_API_KEY" DD_SITE="datadoghq.com" bash -c "$(curl -fsSL https://install.datadoghq.com/scripts/install_script_agent7.sh)"
+
+  # Enable log collection, container autodiscovery, and tags
+  sudo tee -a /etc/datadog-agent/datadog.yaml > /dev/null <<EOF
+
+logs_enabled: true
+logs_config:
+  container_collect_all: true
+
+listeners:
+  - name: docker
+
+config_providers:
+  - name: docker
+    polling: true
+
+tags:
+  - owner:integrations
+  - tenant:$TENANT
+  - machine_user_id:$MACHINE_USER_ID
+EOF
+
+  # Add dd-agent user to docker group
+  sudo usermod -aG docker dd-agent
+
+  # Add dd-agent user to systemd-journal group
+  sudo usermod -aG systemd-journal dd-agent
+
+  # Collect run-edge systemd service logs
+  sudo mkdir -p /etc/datadog-agent/conf.d/run-edge.d
+  sudo tee /etc/datadog-agent/conf.d/run-edge.d/conf.yaml > /dev/null <<EOF
+logs:
+  - type: journald
+    source: nio-edge
+    service: nio-edge-run-edge
+    include_units:
+      - run-edge.service
+EOF
+
+  sudo systemctl enable datadog-agent
+  sudo systemctl restart datadog-agent
+}
+
 install_remoteit() {
   echo "------------------------------
 Installing Remoteit
@@ -50,11 +151,6 @@ Installing Remoteit
   if [ ! -e "/etc/remoteit" ] || [ ! -L "/etc/remoteit" ]; then
     echo "Linking /etc/remoteit to $NIO_DIR/remoteit"
     sudo ln -s "$NIO_DIR/remoteit" /etc/remoteit
-  fi
-
-  if [[ -z "$R3_REGISTRATION_CODE" ]]; then
-    echo "Error: R3_REGISTRATION_CODE environment variable not set."
-    exit 1
   fi
 
   R3_REGISTRATION_CODE="$R3_REGISTRATION_CODE" sh -c "$(curl -fsSL https://downloads.remote.it/remoteit/install_agent.sh)"
@@ -72,7 +168,7 @@ Installing Docker
   fi
 
   # Remove conflicts
-  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove -y $pkg || true; done
 
   # Add Docker's official GPG key
   sudo apt-get update
@@ -99,12 +195,6 @@ Installing Docker
 
 download_github_asset() {
   local token="$GITHUB_TOKEN"
-
-  if [[ -z "$token" ]]; then
-    echo "Error: GITHUB_TOKEN environment variable not set."
-    exit 1
-  fi
-
   local api_url
   if [[ -n "$NIO_EDGE_VERSION" ]]; then
     echo "Using specified version: $NIO_EDGE_VERSION"
@@ -156,11 +246,6 @@ Initializing NIO environment
 }
 
 create_service() {
-  if [[ "$OS_NAME" != "linux" ]]; then
-    echo "Skipping service setup: unsupported on $OS_NAME"
-    return
-  fi
-
   echo "Creating environment file at $NIO_DIR/run-edge.env"
   sudo tee $NIO_DIR/run-edge.env > /dev/null <<EOF
 IDENTITY=$MACHINE_USER_ID
@@ -195,12 +280,11 @@ EOF
 }
 
 
-# Ensure required packages are installed
 echo "Installing required packages"
 sudo apt-get update
 sudo apt-get install -y curl ca-certificates jq tar unzip
 
-# Optional installs
+install_datadog
 install_docker
 install_remoteit
 
