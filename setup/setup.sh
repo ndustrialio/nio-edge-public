@@ -117,8 +117,10 @@ tags:
   - machine_user_id:$MACHINE_USER_ID
 EOF
 
-  # Add dd-agent user to docker group
-  sudo usermod -aG docker dd-agent
+  # Add dd-agent user to docker group (if docker is installed)
+  if getent group docker >/dev/null 2>&1; then
+    sudo usermod -aG docker dd-agent
+  fi
 
   # Add dd-agent user to systemd-journal group
   sudo usermod -aG systemd-journal dd-agent
@@ -145,7 +147,7 @@ Installing Remoteit
   
   if [ ! -d "$NIO_DIR/remoteit" ]; then
     echo "Creating remoteit directory at $NIO_DIR/remoteit"
-    mkdir -p "$NIO_DIR/remoteit"
+    sudo mkdir -p "$NIO_DIR/remoteit"
   fi
 
   if [ ! -e "/etc/remoteit" ] || [ ! -L "/etc/remoteit" ]; then
@@ -234,9 +236,9 @@ Initializing NIO environment
   echo "Extracting asset"
   case "$OS_NAME" in
     linux|macos)
-      tar -xzf "$NIO_DIR/run-edge.archive" -C "$NIO_DIR"
-      rm -f "$NIO_DIR/run-edge.archive"
-      chmod +x "$NIO_DIR/run-edge"
+      sudo tar -xzf "$NIO_DIR/run-edge.archive" -C "$NIO_DIR"
+      sudo rm -f "$NIO_DIR/run-edge.archive"
+      sudo chmod +x "$NIO_DIR/run-edge"
       ;;
     windows)
       unzip -o "$NIO_DIR/run-edge.archive" -d "$NIO_DIR"
@@ -284,9 +286,9 @@ echo "Installing required packages"
 sudo apt-get update
 sudo apt-get install -y curl ca-certificates jq tar unzip
 
-install_datadog
 install_docker
 install_remoteit
+install_datadog
 
 initialize_nio
 create_service
