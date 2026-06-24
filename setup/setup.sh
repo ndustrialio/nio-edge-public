@@ -4,6 +4,99 @@ set -e
 NIO_DIR="/nio"
 LOG_FILE="/tmp/setup-$(date +%Y%m%d-%H%M%S).log"
 
+# --- Pure render functions (no side effects); used by provisioning and tests ---
+render_facility_netplan() {
+  local iface="${FACILITY_IFACE:?FACILITY_IFACE required}"
+  if [[ "${DEPLOYMENT_TYPE:-}" == "iot-integration" ]]; then
+    # Production: single interface owns the main default route; no policy routing.
+    if [[ "${FACILITY_NIC_MODE:-dhcp}" == "static" ]]; then
+      cat <<EOF
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      addresses: [ "${FACILITY_ADDR:?FACILITY_ADDR required for static}" ]
+      dhcp4: false
+      routes:
+        - { to: 0.0.0.0/0, via: "${FACILITY_GW:?FACILITY_GW required for static}" }
+EOF
+    else
+      cat <<EOF
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      dhcp4: true
+EOF
+    fi
+  elif [[ "${DEPLOYMENT_TYPE:-}" == "iot-networking" ]]; then
+    # Validation (iot-networking): facility -> table 200, backhaul -> main default.
+    local backhaul="${BACKHAUL_IFACE:?BACKHAUL_IFACE required for validation}"
+    if [[ "${FACILITY_NIC_MODE:-dhcp}" == "static" ]]; then
+      cat <<EOF
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      addresses: [ "${FACILITY_ADDR:?FACILITY_ADDR required for static}" ]
+      dhcp4: false
+      routes:
+        - { to: 0.0.0.0/0, via: "${FACILITY_GW:?FACILITY_GW required for static}", table: 200 }
+        - { to: "${FACILITY_PREFIX:?FACILITY_PREFIX required for static}", scope: link, table: 200 }
+      routing-policy:
+        - { from: "${FACILITY_ADDR%%/*}/32", table: 200 }
+    ${backhaul}:
+      dhcp4: true
+EOF
+    else
+      cat <<EOF
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false
+    ${backhaul}:
+      dhcp4: true
+EOF
+    fi
+  else
+    echo "ERROR: unknown DEPLOYMENT_TYPE '${DEPLOYMENT_TYPE:-}' (expected iot-networking or iot-integration)" >&2
+    return 1
+  fi
+}
+
+render_table200_hook() {
+  local iface="${FACILITY_IFACE:?FACILITY_IFACE required}"
+  # Escaped \$ keeps these expansions in the generated hook, not in this renderer.
+  cat <<EOF
+#!/bin/bash
+# Installs policy-routing table 200 for the facility (test) interface on lease.
+# Managed by nio-edge setup.sh — do not edit by hand.
+set -eu
+[[ "\${IFACE:-}" == "${iface}" ]] || exit 0
+
+ifindex="\$(cat "/sys/class/net/${iface}/ifindex" 2>/dev/null || true)"
+facility_ip="\$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)"
+facility_subnet="\$(ip -4 -o route show dev "${iface}" scope link 2>/dev/null | awk '{print \$1}' | head -n1)"
+facility_gw="\$(awk -F= '/^ROUTER=/{print \$2; exit}' "/run/systemd/netif/leases/\${ifindex}" 2>/dev/null || true)"
+
+[[ -n "\$facility_ip" ]] || exit 0
+
+ip rule del from all lookup 200 2>/dev/null || true
+ip rule add from "\$facility_ip"/32 lookup 200
+[[ -n "\$facility_gw" ]] && ip route replace default via "\$facility_gw" dev "${iface}" table 200
+[[ -n "\$facility_subnet" ]] && ip route replace "\$facility_subnet" dev "${iface}" scope link table 200
+EOF
+}
+
+# --- Render-only dispatch: must stay before logging/trap so it has no side effects ---
+case "${1:-}" in
+  render-netplan) render_facility_netplan; exit 0 ;;
+  render-hook) render_table200_hook; exit 0 ;;
+esac
+
 # Capture all output to a log file
 exec > >(tee "$LOG_FILE") 2>&1
 
@@ -75,7 +168,7 @@ fi
 
 # Validate required environment variables early
 missing_vars=()
-for var in DD_API_KEY GITHUB_TOKEN R3_REGISTRATION_CODE QUAY_TOKEN TENANT MACHINE_USER_ID EDGE_TOKEN; do
+for var in DD_API_KEY GITHUB_TOKEN R3_REGISTRATION_CODE QUAY_TOKEN TENANT MACHINE_USER_ID EDGE_TOKEN DEPLOYMENT_TYPE FACILITY_IFACE FACILITY_NIC_MODE; do
   if [[ -z "${!var}" ]]; then
     missing_vars+=("$var")
   fi
@@ -195,6 +288,33 @@ Installing Docker
   echo "$QUAY_TOKEN" | docker login --username "ndustrialio+nio_edge_$TENANT" --password-stdin quay.io
 }
 
+configure_facility_network() {
+  echo "------------------------------
+Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_MODE=${FACILITY_NIC_MODE})
+------------------------------"
+
+  render_facility_netplan > /etc/netplan/99-nio-netplan-config.yaml
+  chmod 600 /etc/netplan/99-nio-netplan-config.yaml
+
+  local hook="/etc/networkd-dispatcher/routable.d/50-iot-table200"
+  if [[ "${DEPLOYMENT_TYPE}" == "iot-networking" && "${FACILITY_NIC_MODE}" == "dhcp" ]]; then
+    mkdir -p /etc/networkd-dispatcher/routable.d
+    render_table200_hook > "$hook"
+    chmod 755 "$hook"
+  else
+    rm -f "$hook"
+  fi
+
+  netplan apply
+
+  echo "--- routing self-check ---"
+  ip rule || true
+  ip route show table main || true
+  if [[ "${DEPLOYMENT_TYPE}" == "iot-networking" ]]; then
+    ip route show table 200 || true
+  fi
+}
+
 download_github_asset() {
   local token="$GITHUB_TOKEN"
   local api_url
@@ -254,6 +374,7 @@ IDENTITY=$MACHINE_USER_ID
 EDGE_TOKEN=$EDGE_TOKEN
 DIRECTORY=$NIO_DIR
 TENANT=$TENANT
+DEPLOYMENT_TYPE=$DEPLOYMENT_TYPE
 EOF
   sudo chmod 640 $NIO_DIR/run-edge.env
   sudo chown root:root $NIO_DIR/run-edge.env
@@ -284,8 +405,9 @@ EOF
 
 echo "Installing required packages"
 sudo apt-get update
-sudo apt-get install -y curl ca-certificates jq tar unzip
+sudo apt-get install -y curl ca-certificates jq tar unzip networkd-dispatcher
 
+configure_facility_network
 install_docker
 install_remoteit
 install_datadog
