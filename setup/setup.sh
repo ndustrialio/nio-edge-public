@@ -91,10 +91,31 @@ ip rule add from "\$facility_ip"/32 lookup 200
 EOF
 }
 
+emit_facility_env() {
+  # Print the non-secret networking/deployment vars as KEY=value lines.
+  # Secrets are intentionally never emitted here.
+  echo "DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE:-}"
+  echo "FACILITY_IFACE=${FACILITY_IFACE:-}"
+  echo "FACILITY_NIC_MODE=${FACILITY_NIC_MODE:-}"
+  local v
+  for v in BACKHAUL_IFACE FACILITY_ADDR FACILITY_GW FACILITY_PREFIX; do
+    if [[ -n "${!v:-}" ]]; then echo "$v=${!v}"; fi
+  done
+}
+
+write_facility_env() {
+  # Persist what was applied so verify-routing.sh can read the scenario
+  # (DEPLOYMENT_TYPE, interfaces, NIC mode) without re-specifying every var.
+  mkdir -p /etc/nio
+  emit_facility_env > /etc/nio/facility.env
+  chmod 600 /etc/nio/facility.env
+}
+
 # --- Render-only dispatch: must stay before logging/trap so it has no side effects ---
 case "${1:-}" in
   render-netplan) render_facility_netplan; exit 0 ;;
   render-hook) render_table200_hook; exit 0 ;;
+  render-facility-env) emit_facility_env; exit 0 ;;
 esac
 
 # Capture all output to a log file
@@ -166,9 +187,10 @@ if [[ "$OS_NAME" != "linux" ]]; then
   exit 1
 fi
 
-# Validate required environment variables early
+# Validate always-required environment variables early (before any installs).
+# The loop reports every missing var at once, rather than failing on the first.
 missing_vars=()
-for var in DD_API_KEY GITHUB_TOKEN R3_REGISTRATION_CODE QUAY_TOKEN TENANT MACHINE_USER_ID EDGE_TOKEN DEPLOYMENT_TYPE FACILITY_IFACE FACILITY_NIC_MODE; do
+for var in DD_API_KEY GITHUB_TOKEN R3_REGISTRATION_CODE QUAY_TOKEN TENANT MACHINE_USER_ID EDGE_TOKEN DEPLOYMENT_TYPE FACILITY_NIC_MODE; do
   if [[ -z "${!var}" ]]; then
     missing_vars+=("$var")
   fi
@@ -177,6 +199,13 @@ if [[ ${#missing_vars[@]} -gt 0 ]]; then
   echo "Error: Required environment variables not set: ${missing_vars[*]}"
   exit 1
 fi
+
+# Validate deployment-type-specific network vars via render_facility_netplan,
+# whose ${VAR:?} guards are the source of truth for what each DEPLOYMENT_TYPE and
+# FACILITY_NIC_MODE requires (e.g. BACKHAUL_IFACE for iot-networking, FACILITY_ADDR
+# for static). It's a pure function, so rendering to /dev/null fails fast on any
+# missing var here — before packages are installed — with no side effects.
+render_facility_netplan > /dev/null
 
 install_datadog() {
   echo "------------------------------
@@ -304,6 +333,8 @@ Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_M
   else
     rm -f "$hook"
   fi
+
+  write_facility_env
 
   netplan apply
 
