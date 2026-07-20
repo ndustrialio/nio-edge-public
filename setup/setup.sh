@@ -2,6 +2,9 @@
 set -e
 
 NIO_DIR="/nio"
+# Records the applied iot-networking scenario for verify-routing.sh. Kept off the
+# persistent /nio volume so it is regenerated per provision and never goes stale.
+NETWORK_ENV_FILE="/etc/ndustrial/iot-networking/network.env"
 LOG_FILE="/tmp/setup-$(date +%Y%m%d-%H%M%S).log"
 
 # --- Pure render functions (no side effects); used by provisioning and tests ---
@@ -91,9 +94,13 @@ ip rule add from "\$facility_ip"/32 lookup 200
 EOF
 }
 
-emit_facility_env() {
+emit_network_env() {
   # Print the non-secret networking/deployment vars as KEY=value lines.
   # Secrets are intentionally never emitted here.
+  # This set MUST remain a superset of the vars that render_facility_netplan
+  # requires (its ${VAR:?} guards), because verify-routing.sh sources this file
+  # and re-runs `render-netplan`/`render-hook` to reproduce the applied config —
+  # a var required by the renderer but missing here breaks verification.
   echo "DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE:-}"
   echo "FACILITY_IFACE=${FACILITY_IFACE:-}"
   echo "FACILITY_NIC_MODE=${FACILITY_NIC_MODE:-}"
@@ -103,19 +110,20 @@ emit_facility_env() {
   done
 }
 
-write_facility_env() {
+write_network_env() {
   # Persist what was applied so verify-routing.sh can read the scenario
   # (DEPLOYMENT_TYPE, interfaces, NIC mode) without re-specifying every var.
-  mkdir -p /etc/nio
-  emit_facility_env > /etc/nio/facility.env
-  chmod 600 /etc/nio/facility.env
+  # Only written for iot-networking deployments (see configure_facility_network).
+  mkdir -p "$(dirname "$NETWORK_ENV_FILE")"
+  emit_network_env > "$NETWORK_ENV_FILE"
+  chmod 600 "$NETWORK_ENV_FILE"
 }
 
 # --- Render-only dispatch: must stay before logging/trap so it has no side effects ---
 case "${1:-}" in
   render-netplan) render_facility_netplan; exit 0 ;;
   render-hook) render_table200_hook; exit 0 ;;
-  render-facility-env) emit_facility_env; exit 0 ;;
+  render-network-env) emit_network_env; exit 0 ;;
 esac
 
 # Capture all output to a log file
@@ -334,7 +342,14 @@ Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_M
     rm -f "$hook"
   fi
 
-  write_facility_env
+  # The network.env scenario record is only consumed by verify-routing.sh, which
+  # is iot-networking-only; write it just for that type and clear any stale copy
+  # left by a prior iot-networking provision otherwise.
+  if [[ "${DEPLOYMENT_TYPE}" == "iot-networking" ]]; then
+    write_network_env
+  else
+    rm -f "$NETWORK_ENV_FILE"
+  fi
 
   netplan apply
 
@@ -360,11 +375,29 @@ download_github_asset() {
   local download_target="$NIO_DIR/run-edge.archive"
 
   echo "Fetching release metadata from GitHub API: $api_url"
-  asset_url=$(curl -s -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" "$api_url" \
-    | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .url')
+  local response http_status metadata curl_exit=0
+  response=$(curl -s -w '\n%{http_code}' \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.github+json" "$api_url") || curl_exit=$?
+  if [[ $curl_exit -ne 0 ]]; then
+    echo "Error: could not reach GitHub API ($api_url); curl exited $curl_exit." >&2
+    exit 1
+  fi
+  http_status="${response##*$'\n'}"
+  metadata="${response%$'\n'*}"
+
+  if [[ "$http_status" != "200" ]]; then
+    local api_message
+    api_message=$(printf '%s' "$metadata" | jq -r '.message // "unknown error"' 2>/dev/null || echo "unknown error")
+    echo "Error: GitHub API returned HTTP $http_status ($api_message) for $api_url." >&2
+    echo "Check that GITHUB_TOKEN is valid and has 'Contents: Read' access to ndustrialio/nio-edge-api." >&2
+    exit 1
+  fi
+
+  asset_url=$(printf '%s' "$metadata" | jq -r --arg name "$ASSET_NAME" '.assets[]? | select(.name == $name) | .url')
 
   if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-    echo "Error: Asset '$ASSET_NAME' not found in release metadata."
+    echo "Error: Asset '$ASSET_NAME' not found in release metadata." >&2
     exit 1
   fi
 
