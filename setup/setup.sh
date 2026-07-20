@@ -60,6 +60,7 @@ network:
       dhcp4: true
       dhcp4-overrides:
         use-routes: false
+        use-dns: false
     ${backhaul}:
       dhcp4: true
 EOF
@@ -82,7 +83,7 @@ set -eu
 
 ifindex="\$(cat "/sys/class/net/${iface}/ifindex" 2>/dev/null || true)"
 facility_ip="\$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)"
-facility_subnet="\$(ip -4 -o route show dev "${iface}" scope link 2>/dev/null | awk '{print \$1}' | head -n1)"
+facility_subnet="\$(ip -4 -o route show dev "${iface}" scope link proto kernel 2>/dev/null | awk '{print \$1}' | head -n1)"
 facility_gw="\$(awk -F= '/^ROUTER=/{print \$2; exit}' "/run/systemd/netif/leases/\${ifindex}" 2>/dev/null || true)"
 
 [[ -n "\$facility_ip" ]] || exit 0
@@ -92,6 +93,27 @@ ip rule add from "\$facility_ip"/32 lookup 200
 [[ -n "\$facility_gw" ]] && ip route replace default via "\$facility_gw" dev "${iface}" table 200
 [[ -n "\$facility_subnet" ]] && ip route replace "\$facility_subnet" dev "${iface}" scope link table 200
 EOF
+}
+
+IPV6_SYSCTL_FILE="/etc/sysctl.d/99-nio-disable-ipv6.conf"
+
+emit_ipv6_sysctl() {
+  # Pure: the drop-in that disables IPv6 stack-wide. IPv6 is unused on this
+  # device, and the facility network advertises RAs the host must never adopt;
+  # disabling the stack removes an entire class of egress leaks. No side effects.
+  cat <<'EOF'
+# Managed by nio-edge setup.sh — IPv6 is unused on this device. Disabling it
+# prevents the untrusted facility network's Router Advertisements from
+# installing an IPv6 default route that bypasses IPv4 policy routing.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+}
+
+write_ipv6_sysctl() {
+  emit_ipv6_sysctl > "$IPV6_SYSCTL_FILE"
+  chmod 644 "$IPV6_SYSCTL_FILE"
+  sysctl --system >/dev/null
 }
 
 emit_network_env() {
@@ -124,6 +146,7 @@ case "${1:-}" in
   render-netplan) render_facility_netplan; exit 0 ;;
   render-hook) render_table200_hook; exit 0 ;;
   render-network-env) emit_network_env; exit 0 ;;
+  render-ipv6-sysctl) emit_ipv6_sysctl; exit 0 ;;
 esac
 
 # Capture all output to a log file
@@ -143,7 +166,7 @@ ship_logs() {
 
     echo "[{\"ddsource\":\"nio-edge\",\"ddtags\":\"owner:integrations,tenant:${TENANT:-unknown},machine_user_id:${MACHINE_USER_ID:-unknown}\",\"hostname\":\"$(hostname)\",\"service\":\"nio-edge-setup\",\"status\":\"${status}\",\"message\":${log_content}}]" \
       | gzip \
-      | curl -s -X POST "https://http-intake.logs.datadoghq.com/api/v2/logs" \
+      | curl -s -X POST --connect-timeout 10 --max-time 30 "https://http-intake.logs.datadoghq.com/api/v2/logs" \
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
         -H "Content-Encoding: gzip" \
@@ -215,6 +238,20 @@ fi
 # missing var here — before packages are installed — with no side effects.
 render_facility_netplan > /dev/null
 
+fetch_install_script() {
+  # Fetch a remote install script to stdout. Returns nonzero (never exits) on a
+  # download failure or empty body so the caller aborts in the PARENT shell:
+  # `bash -c "$(curl ...)"` swallows curl's exit status (the outer bash -c "" is
+  # exit 0), so a failed download would otherwise run an empty script and let
+  # provisioning continue silently. Callers must use a bare assignment
+  # (`s="$(fetch_install_script URL)" || exit 1`), not `local s="$(...)"`, since
+  # `local` masks the assignment's exit status.
+  local url="$1" body
+  body="$(curl -fsSL --connect-timeout 15 --retry 3 --retry-connrefused --retry-delay 5 "$url")" || return 1
+  [[ -n "$body" ]] || return 1
+  printf '%s' "$body"
+}
+
 install_datadog() {
   echo "------------------------------
 Installing Datadog Agent
@@ -225,7 +262,10 @@ Installing Datadog Agent
     return
   fi
 
-  DD_API_KEY="$DD_API_KEY" DD_SITE="datadoghq.com" bash -c "$(curl -fsSL https://install.datadoghq.com/scripts/install_script_agent7.sh)"
+  local dd_script
+  dd_script="$(fetch_install_script https://install.datadoghq.com/scripts/install_script_agent7.sh)" \
+    || { echo "Error: failed to download Datadog install script" >&2; exit 1; }
+  DD_API_KEY="$DD_API_KEY" DD_SITE="datadoghq.com" bash -c "$dd_script"
 
   # Enable log collection, container autodiscovery, and tags
   sudo tee -a /etc/datadog-agent/datadog.yaml > /dev/null <<EOF
@@ -285,7 +325,10 @@ Installing Remoteit
     sudo ln -s "$NIO_DIR/remoteit" /etc/remoteit
   fi
 
-  R3_REGISTRATION_CODE="$R3_REGISTRATION_CODE" sh -c "$(curl -fsSL https://downloads.remote.it/remoteit/install_agent.sh)"
+  local r3_script
+  r3_script="$(fetch_install_script https://downloads.remote.it/remoteit/install_agent.sh)" \
+    || { echo "Error: failed to download remote.it install script" >&2; exit 1; }
+  R3_REGISTRATION_CODE="$R3_REGISTRATION_CODE" sh -c "$r3_script"
 }
 
 install_docker() {
@@ -305,7 +348,8 @@ Installing Docker
   # Add Docker's official GPG key
   sudo apt-get update
   sudo install -m 0755 -d /etc/apt/keyrings
-  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo curl -fsSL --connect-timeout 15 --retry 3 --retry-connrefused --retry-delay 5 \
+    https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   sudo chmod a+r /etc/apt/keyrings/docker.asc
 
   # Add the repository to Apt sources
@@ -351,13 +395,33 @@ Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_M
     rm -f "$NETWORK_ENV_FILE"
   fi
 
+  write_ipv6_sysctl
   netplan apply
 
-  echo "--- routing self-check ---"
-  ip rule || true
-  ip route show table main || true
   if [[ "${DEPLOYMENT_TYPE}" == "iot-networking" ]]; then
+    echo "--- waiting for backhaul (${BACKHAUL_IFACE}) to own the default route ---"
+    local waited=0 default_dev=""
+    while [[ $waited -lt 60 ]]; do
+      default_dev="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+      [[ "$default_dev" == "${BACKHAUL_IFACE}" ]] && break
+      sleep 3; waited=$((waited + 3))
+    done
+
+    echo "--- routing self-check ---"
+    ip rule || true
+    ip route show table main || true
     ip route show table 200 || true
+
+    if [[ "$default_dev" != "${BACKHAUL_IFACE}" ]]; then
+      echo "ERROR: IPv4 default route egresses '${default_dev:-none}', expected backhaul '${BACKHAUL_IFACE}'." >&2
+      echo "Refusing to provision over an unverified path. Check NIC role assignment and that the backhaul (cellular) NIC is up." >&2
+      exit 1
+    fi
+    if ip -6 route show default 2>/dev/null | grep -q .; then
+      echo "ERROR: an IPv6 default route is present; IPv6 must be disabled (see ${IPV6_SYSCTL_FILE})." >&2
+      exit 1
+    fi
+    echo "Backhaul egress confirmed: default via ${BACKHAUL_IFACE}, no IPv6 default."
   fi
 }
 
@@ -376,7 +440,7 @@ download_github_asset() {
 
   echo "Fetching release metadata from GitHub API: $api_url"
   local response http_status metadata curl_exit=0
-  response=$(curl -s -w '\n%{http_code}' \
+  response=$(curl -s -w '\n%{http_code}' --connect-timeout 15 --retry 3 --retry-connrefused --retry-delay 5 \
     -H "Authorization: Bearer $token" \
     -H "Accept: application/vnd.github+json" "$api_url") || curl_exit=$?
   if [[ $curl_exit -ne 0 ]]; then
@@ -402,7 +466,8 @@ download_github_asset() {
   fi
 
   echo "Downloading asset $ASSET_NAME → $download_target"
-  curl -s -L -H "Authorization: Bearer $token" \
+  curl -s -L --connect-timeout 15 --retry 3 --retry-connrefused --retry-delay 5 \
+       -H "Authorization: Bearer $token" \
        -H "Accept: application/octet-stream" \
        -o "$download_target" "$asset_url"
 }
