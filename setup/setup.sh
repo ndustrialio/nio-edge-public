@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# Unattended provisioning: never let apt/dpkg block on an interactive prompt,
+# and silence the "dpkg-preconfigure: unable to re-open stdin" noise.
+export DEBIAN_FRONTEND=noninteractive
+
 NIO_DIR="/nio"
 # Records the applied iot-networking scenario for verify-routing.sh. Kept off the
 # persistent /nio volume so it is regenerated per provision and never goes stale.
@@ -20,6 +24,8 @@ network:
     ${iface}:
       addresses: [ "${FACILITY_ADDR:?FACILITY_ADDR required for static}" ]
       dhcp4: false
+      accept-ra: false
+      link-local: []
       routes:
         - { to: 0.0.0.0/0, via: "${FACILITY_GW:?FACILITY_GW required for static}" }
 EOF
@@ -30,6 +36,8 @@ network:
   ethernets:
     ${iface}:
       dhcp4: true
+      accept-ra: false
+      link-local: []
 EOF
     fi
   elif [[ "${DEPLOYMENT_TYPE:-}" == "iot-networking" ]]; then
@@ -43,6 +51,8 @@ network:
     ${iface}:
       addresses: [ "${FACILITY_ADDR:?FACILITY_ADDR required for static}" ]
       dhcp4: false
+      accept-ra: false
+      link-local: []
       routes:
         - { to: 0.0.0.0/0, via: "${FACILITY_GW:?FACILITY_GW required for static}", table: 200 }
         - { to: "${FACILITY_PREFIX:?FACILITY_PREFIX required for static}", scope: link, table: 200 }
@@ -50,6 +60,8 @@ network:
         - { from: "${FACILITY_ADDR%%/*}/32", table: 200 }
     ${backhaul}:
       dhcp4: true
+      accept-ra: false
+      link-local: []
 EOF
     else
       cat <<EOF
@@ -58,11 +70,15 @@ network:
   ethernets:
     ${iface}:
       dhcp4: true
+      accept-ra: false
+      link-local: []
       dhcp4-overrides:
         use-routes: false
         use-dns: false
     ${backhaul}:
       dhcp4: true
+      accept-ra: false
+      link-local: []
 EOF
     fi
   else
@@ -95,27 +111,6 @@ ip rule add from "\$facility_ip"/32 lookup 200
 EOF
 }
 
-IPV6_SYSCTL_FILE="/etc/sysctl.d/99-nio-disable-ipv6.conf"
-
-emit_ipv6_sysctl() {
-  # Pure: the drop-in that disables IPv6 stack-wide. IPv6 is unused on this
-  # device, and the facility network advertises RAs the host must never adopt;
-  # disabling the stack removes an entire class of egress leaks. No side effects.
-  cat <<'EOF'
-# Managed by nio-edge setup.sh — IPv6 is unused on this device. Disabling it
-# prevents the untrusted facility network's Router Advertisements from
-# installing an IPv6 default route that bypasses IPv4 policy routing.
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-EOF
-}
-
-write_ipv6_sysctl() {
-  emit_ipv6_sysctl > "$IPV6_SYSCTL_FILE"
-  chmod 644 "$IPV6_SYSCTL_FILE"
-  sysctl --system >/dev/null
-}
-
 emit_network_env() {
   # Print the non-secret networking/deployment vars as KEY=value lines.
   # Secrets are intentionally never emitted here.
@@ -141,12 +136,23 @@ write_network_env() {
   chmod 600 "$NETWORK_ENV_FILE"
 }
 
+print_startup_banner() {
+  echo "=================================================================="
+  echo " nio-edge setup"
+  echo " host=$(hostname)  started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo " tenant=${TENANT:-unknown}  machine_user_id=${MACHINE_USER_ID:-unknown}"
+  echo " deployment_type=${DEPLOYMENT_TYPE:-unknown}  facility_nic_mode=${FACILITY_NIC_MODE:-unknown}"
+  echo " facility_iface=${FACILITY_IFACE:-unknown}  backhaul_iface=${BACKHAUL_IFACE:-unknown}"
+  echo " nio_edge_version=${NIO_EDGE_VERSION:-latest}"
+  echo " log=${LOG_FILE}"
+  echo "=================================================================="
+}
+
 # --- Render-only dispatch: must stay before logging/trap so it has no side effects ---
 case "${1:-}" in
   render-netplan) render_facility_netplan; exit 0 ;;
   render-hook) render_table200_hook; exit 0 ;;
   render-network-env) emit_network_env; exit 0 ;;
-  render-ipv6-sysctl) emit_ipv6_sysctl; exit 0 ;;
 esac
 
 # Capture all output to a log file
@@ -164,7 +170,7 @@ ship_logs() {
     local log_content
     log_content=$(jq -Rs '.' < "$LOG_FILE")
 
-    echo "[{\"ddsource\":\"nio-edge\",\"ddtags\":\"owner:integrations,tenant:${TENANT:-unknown},machine_user_id:${MACHINE_USER_ID:-unknown}\",\"hostname\":\"$(hostname)\",\"service\":\"nio-edge-setup\",\"status\":\"${status}\",\"message\":${log_content}}]" \
+    echo "[{\"ddsource\":\"nio-edge\",\"ddtags\":\"owner:integrations,tenant:${TENANT:-unknown},machine_user_id:${MACHINE_USER_ID:-unknown},deployment_type:${DEPLOYMENT_TYPE:-unknown}\",\"hostname\":\"$(hostname)\",\"service\":\"nio-edge-setup\",\"status\":\"${status}\",\"message\":${log_content}}]" \
       | gzip \
       | curl -s -X POST --connect-timeout 10 --max-time 30 "https://http-intake.logs.datadoghq.com/api/v2/logs" \
         -H "Accept: application/json" \
@@ -178,6 +184,8 @@ ship_logs() {
   exit "$exit_code"
 }
 trap ship_logs EXIT
+
+print_startup_banner
 
 # Detect OS and architecture
 UNAME_OS="$(uname -s)"
@@ -343,10 +351,10 @@ Installing Docker
   fi
 
   # Remove conflicts
-  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove -y $pkg || true; done
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove -y -qq $pkg || true; done
 
   # Add Docker's official GPG key
-  sudo apt-get update
+  sudo apt-get update -qq
   sudo install -m 0755 -d /etc/apt/keyrings
   sudo curl -fsSL --connect-timeout 15 --retry 3 --retry-connrefused --retry-delay 5 \
     https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -357,10 +365,10 @@ Installing Docker
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
     $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
     sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-  sudo apt-get update
+  sudo apt-get update -qq
 
   # Install Docker and start
-  sudo apt-get install -y docker-ce
+  sudo apt-get install -y -q docker-ce
   sudo systemctl enable docker
   sudo systemctl start docker
   if id nio &>/dev/null; then
@@ -395,7 +403,6 @@ Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_M
     rm -f "$NETWORK_ENV_FILE"
   fi
 
-  write_ipv6_sysctl
   netplan apply
 
   if [[ "${DEPLOYMENT_TYPE}" == "iot-networking" ]]; then
@@ -410,7 +417,14 @@ Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_M
     echo "--- routing self-check ---"
     ip rule || true
     ip route show table main || true
-    ip route show table 200 || true
+    # Table 200 is populated by the routable-hook only once the facility NIC gets
+    # a lease; during backhaul-only provisioning it is legitimately empty, so
+    # only dump it when the policy rule exists (avoids a misleading FIB error).
+    if ip rule 2>/dev/null | grep -q 'lookup 200'; then
+      ip route show table 200 || true
+    else
+      echo "(table 200 not yet populated — facility NIC not connected during provisioning)"
+    fi
 
     if [[ "$default_dev" != "${BACKHAUL_IFACE}" ]]; then
       echo "ERROR: IPv4 default route egresses '${default_dev:-none}', expected backhaul '${BACKHAUL_IFACE}'." >&2
@@ -418,7 +432,7 @@ Configuring facility network (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}, FACILITY_NIC_M
       exit 1
     fi
     if ip -6 route show default 2>/dev/null | grep -q .; then
-      echo "ERROR: an IPv6 default route is present; IPv6 must be disabled (see ${IPV6_SYSCTL_FILE})." >&2
+      echo "ERROR: an IPv6 default route is present; IPv6 must be disabled (accept-ra: false in netplan)." >&2
       exit 1
     fi
     echo "Backhaul egress confirmed: default via ${BACKHAUL_IFACE}, no IPv6 default."
@@ -529,12 +543,23 @@ EOF
   sudo systemctl daemon-reload
   sudo systemctl enable run-edge.service
   sudo systemctl start run-edge.service
+
+  # `systemctl start` returns success as soon as the unit launches; with
+  # Restart=always a binary that starts then immediately crashes would
+  # crash-loop silently and still look like a clean provision. Verify it stays up.
+  sleep 3
+  if ! sudo systemctl is-active --quiet run-edge.service; then
+    echo "ERROR: run-edge.service did not stay active after start." >&2
+    sudo journalctl -u run-edge.service -n 30 --no-pager || true
+    exit 1
+  fi
+  echo "run-edge.service is active."
 }
 
 
 echo "Installing required packages"
-sudo apt-get update
-sudo apt-get install -y curl ca-certificates jq tar unzip networkd-dispatcher
+sudo apt-get update -qq
+sudo apt-get install -y -q curl ca-certificates jq tar unzip networkd-dispatcher
 
 configure_facility_network
 install_docker
